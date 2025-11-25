@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flow-grpo"
+version = "0.0.1"
+description = "Training Flow Matching Models via Online RL"
+readme = "README.md"
+requires-python = "~=3.10.0"
+license = { text = "MIT" }
+authors = [{ name = "Flow-GRPO Team" }]
+keywords = [
+    "flow-matching",
+    "reinforcement-learning",
+    "diffusion",
+    "stable-diffusion",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "torchaudio",
+    "transformers==4.56.1",
+    "accelerate==1.4.0",
+    "diffusers @ git+https://github.com/huggingface/diffusers@7a2b78bf0f788d311cc96b61e660a8e13e3b1e63",
+    "numpy==1.26.4",
+    "pandas==2.2.3",
+    "scipy==1.15.2",
+    "scikit-learn==1.6.1",
+    "scikit-image==0.25.2",
+    "albumentations==1.4.10",
+    "opencv-python==4.11.0.86",
+    "pillow==10.4.0",
+    "tqdm==4.67.1",
+    "wandb==0.18.7",
+    "pydantic==2.10.6",
+    "requests==2.32.3",
+    "matplotlib==3.10.0",
+    "peft",
+    "aiohttp>=3.10.0",
+    "fastapi==0.115.11",
+    "uvicorn==0.34.0",
+    "huggingface-hub",
+    "datasets==3.3.2",
+    "tokenizers",
+    "einops==0.8.1",
+    "absl-py",
+    "ml_collections",
+    "sentencepiece",
+    "openai",
+    # GPU-specific dependencies (Linux/Windows only)
+    "deepspeed==0.16.4; sys_platform != 'darwin'",
+    "bitsandbytes==0.45.3; sys_platform != 'darwin'",
+    "nvidia-ml-py==12.570.86; sys_platform != 'darwin'",
+    "xformers; sys_platform != 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = ["ipython==8.34.0", "black==24.2.0", "pytest==8.2.0"]
+
+[project.urls]
+Homepage = "https://github.com/yifan123/flow_grpo"
+Repository = "https://github.com/yifan123/flow_grpo"
+Documentation = "https://gongyeliu.github.io/Flow-GRPO/"
+Paper = "https://arxiv.org/abs/2505.05470"
+
+[tool.setuptools]
+packages = ["flow_grpo", "config", "dataset", "scripts"]
+
+[tool.setuptools.package-data]
+flow_grpo = ["assets/**/*"]
+
+[tool.black]
+line-length = 120
+target-version = ['py310']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
