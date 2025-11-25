@@ -74,10 +74,11 @@ Documentation = "https://gongyeliu.github.io/Flow-GRPO/"
 Paper = "https://arxiv.org/abs/2505.05470"
 
 [tool.setuptools]
-packages = ["flow_grpo", "config", "dataset", "scripts"]
+# packages = ["flow_grpo", "config", "dataset", "scripts"]
+packages = ["flow_grpo"]
 
-# [tool.setuptools.package-data]
-# flow_grpo = ["assets/**/*"]
+[tool.setuptools.package-data]
+flow_grpo = ["assets/**/*", "bagel/**/*", "diffusers_patch/**/*"]
 
 [tool.black]
 line-length = 120
