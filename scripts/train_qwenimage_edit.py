@@ -596,13 +596,10 @@ def main(_):
         if epoch % config.save_freq == 0 and epoch > 0:
             save_ddp_checkpoint(config.save_dir, transformer, global_step, rank)
         if epoch % config.eval_freq == 0:
-            # Only run eval on rank 0 to save memory (DDP has full model on each GPU)
-            if rank == 0:
-                # Clear cache before eval to maximize available memory
-                torch.cuda.empty_cache()
-                eval(pipeline, test_dataloader, config, rank, local_rank, world_size, device, global_step, eval_reward_fn, executor, autocast, ema, transformer_trainable_parameters)
-            # Other ranks wait at barrier
-            dist.barrier()
+            # Clear cache before eval to maximize available memory
+            torch.cuda.empty_cache()
+            # All ranks run eval in parallel (distributed evaluation)
+            eval(pipeline, test_dataloader, config, rank, local_rank, world_size, device, global_step, eval_reward_fn, executor, autocast, ema, transformer_trainable_parameters)
 
         
         #################### SAMPLING ####################
