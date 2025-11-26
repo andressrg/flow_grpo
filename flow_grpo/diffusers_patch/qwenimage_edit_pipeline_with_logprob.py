@@ -92,7 +92,9 @@ def pipeline_with_logprob(
     prompt_embeds, negative_prompt_embeds = prompt_embeds.chunk(2, dim=0)
     prompt_embeds_mask, negative_prompt_embeds_mask = prompt_embeds_mask.chunk(2, dim=0)
     # 4. Prepare latent variables
-    num_channels_latents = self.transformer.config.in_channels // 4
+    # Handle DDP wrapping: access .module if wrapped, otherwise use transformer directly
+    transformer_module = getattr(self.transformer, 'module', self.transformer)
+    num_channels_latents = transformer_module.config.in_channels // 4
     latents, image_latents = self.prepare_latents(
         image,
         batch_size * num_images_per_prompt,
@@ -131,17 +133,17 @@ def pipeline_with_logprob(
     self._num_timesteps = len(timesteps)
 
     # handle guidance
-    if self.transformer.config.guidance_embeds and guidance_scale is None:
+    if transformer_module.config.guidance_embeds and guidance_scale is None:
         raise ValueError("guidance_scale is required for guidance-distilled model.")
-    elif self.transformer.config.guidance_embeds:
+    elif transformer_module.config.guidance_embeds:
         guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
         guidance = guidance.expand(latents.shape[0])
-    elif not self.transformer.config.guidance_embeds and guidance_scale is not None:
+    elif not transformer_module.config.guidance_embeds and guidance_scale is not None:
         logger.warning(
             f"guidance_scale is passed as {guidance_scale}, but ignored since the model is not guidance-distilled."
         )
         guidance = None
-    elif not self.transformer.config.guidance_embeds and guidance_scale is None:
+    elif not transformer_module.config.guidance_embeds and guidance_scale is None:
         guidance = None
     if self.attention_kwargs is None:
         self._attention_kwargs = {}

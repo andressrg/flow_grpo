@@ -9,7 +9,7 @@ import hashlib
 from absl import app, flags
 from ml_collections import config_flags
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import logging
 import itertools
@@ -20,7 +20,7 @@ from diffusers import QwenImageEditPipeline, QwenImageTransformer2DModel
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import calculate_shift, calculate_dimensions
 
-from flow_grpo.fsdp_utils import FSDPConfig, fsdp_wrapper, init_distributed, save_fsdp_checkpoint, register_optimizer_offload_hooks
+from flow_grpo.fsdp_utils import init_distributed
 import numpy as np
 import flow_grpo.prompts
 import flow_grpo.rewards
@@ -332,19 +332,22 @@ def eval(pipeline, test_dataloader, config, rank, local_rank, world_size, device
         ema.copy_temp_to(transformer_trainable_parameters)
 
 
-def get_transformer_layer_cls():
-    from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformerBlock
-    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLVisionBlock, Qwen2_5_VLDecoderLayer
-    return {
-        QwenImageTransformerBlock,
-        # QwenImageResidualBlock,
-        # QwenImageResample,
-        # QwenImageResidualBlock,
-        # QwenImageMidBlock,
-        # QwenImageAttentionBlock,
-        Qwen2_5_VLVisionBlock,
-        Qwen2_5_VLDecoderLayer
-        }
+def save_ddp_checkpoint(save_dir, model, global_step, rank):
+    """Save DDP model checkpoint (only rank 0 saves)"""
+    import os
+    from safetensors.torch import save_file
+
+    save_path = os.path.join(save_dir, f"checkpoint-{global_step}")
+    os.makedirs(save_path, exist_ok=True)
+
+    # Only rank 0 saves
+    if rank == 0:
+        # Get state dict from DDP wrapper
+        state_dict = model.module.state_dict()
+        save_file(state_dict, os.path.join(save_path, "model.safetensors"))
+        print(f"Model saved: {save_path}/model.safetensors")
+
+    dist.barrier()
 
 def main(_):
     # basic Accelerate and logging setup
@@ -372,7 +375,7 @@ def main(_):
     if rank == 0:
         wandb.init(
             project="flow_grpo",
-            # mode="disabled"
+            mode="disabled"
         )
     logger.info(f"\n{config}")
 
@@ -442,20 +445,15 @@ def main(_):
     
     transformer = pipeline.transformer
 
-    # Setup FSDP configuration
-    fsdp_config = FSDPConfig(
-        sharding_strategy="FULL_SHARD",
-        backward_prefetch="BACKWARD_PRE",
-        cpu_offload=False,  # Set to True if memory is limited
-        num_replicate=1,
-        num_shard=world_size,
-        mixed_precision_dtype=inference_dtype,
-        use_activation_checkpointing=config.activation_checkpointing,
-        use_device_mesh=False, 
+    # Wrap with DDP for distributed training
+    # Model already on device in correct dtype (bf16), no conversion needed
+    transformer = DDP(
+        transformer,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=False,
+        gradient_as_bucket_view=True,  # Memory optimization
     )
-    # Wrap language model with FSDP
-    transformer.cpu().to(dtype=torch.float32)
-    transformer = fsdp_wrapper(transformer, fsdp_config, get_transformer_layer_cls)
     pipeline.transformer = transformer
 
     if config.train.beta > 0:
@@ -466,11 +464,12 @@ def main(_):
         )
         transformer_ref.eval()
         transformer_ref.requires_grad_(False)
-        transformer_ref.cpu().to(dtype=torch.float32)
-        transformer_ref = fsdp_wrapper(transformer_ref, fsdp_config, get_transformer_layer_cls)
+        # Load ref model to device in bf16
+        # Don't wrap with DDP - it's frozen (no trainable params)
+        transformer_ref = transformer_ref.to(device, dtype=inference_dtype)
 
-    pipeline.text_encoder.cpu().to(dtype=torch.float32)
-    pipeline.text_encoder = fsdp_wrapper(pipeline.text_encoder, fsdp_config, get_transformer_layer_cls)
+    # Text encoder is frozen, don't wrap with DDP
+    # (DDP only needed for models with trainable parameters)
 
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
     # This ema setting affects the previous 20 × 8 = 160 steps on average.
@@ -502,8 +501,9 @@ def main(_):
         eps=config.train.adam_epsilon,
     )
 
-    if config.fsdp_optimizer_offload:
-        optimizer = register_optimizer_offload_hooks(optimizer)
+    # DDP doesn't need optimizer offloading
+    # if config.fsdp_optimizer_offload:
+    #     optimizer = register_optimizer_offload_hooks(optimizer)
     
     train_dataset = GenevalPromptImageDataset(config.dataset, 'train')
     test_dataset = GenevalPromptImageDataset(config.dataset, 'test')
@@ -550,12 +550,11 @@ def main(_):
     else:
         autocast = contextlib.nullcontext
 
-    # FSDP doesn't need deepspeed configuration
-    # prepare prompt and reward fn
+    # Prepare prompt and reward fn
     reward_fn = getattr(flow_grpo.rewards, 'multi_score')(device, config.reward_fn)
     eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(device, config.reward_fn)
-    
-    # FSDP setup completed above
+
+    # DDP setup completed above
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
     executor = futures.ThreadPoolExecutor(max_workers=8)
@@ -595,9 +594,15 @@ def main(_):
         #################### EVAL ####################
         pipeline.transformer.eval()
         if epoch % config.save_freq == 0 and epoch > 0:
-            save_fsdp_checkpoint(config.save_dir, transformer, global_step, rank)
+            save_ddp_checkpoint(config.save_dir, transformer, global_step, rank)
         if epoch % config.eval_freq == 0:
-            eval(pipeline, test_dataloader, config, rank, local_rank, world_size, device, global_step, eval_reward_fn, executor, autocast, ema, transformer_trainable_parameters)
+            # Only run eval on rank 0 to save memory (DDP has full model on each GPU)
+            if rank == 0:
+                # Clear cache before eval to maximize available memory
+                torch.cuda.empty_cache()
+                eval(pipeline, test_dataloader, config, rank, local_rank, world_size, device, global_step, eval_reward_fn, executor, autocast, ema, transformer_trainable_parameters)
+            # Other ranks wait at barrier
+            dist.barrier()
 
         
         #################### SAMPLING ####################
@@ -842,74 +847,80 @@ def main(_):
                     leave=False,
                     disable=local_rank != 0,
                 ):
-                    # Manual gradient accumulation for FSDP
+                    # Manual gradient accumulation for DDP
                     if (i * num_train_timesteps + j + 1) % gradient_accumulation_steps == 0:
                         should_sync = True
                     else:
                         should_sync = False
-                    
-                    with autocast():
-                        prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, config, rank)
+
+                    # Use no_sync context to prevent gradient synchronization during accumulation
+                    sync_context = contextlib.nullcontext() if should_sync else transformer.no_sync()
+
+                    with sync_context:
+                        with autocast():
+                            prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, config, rank)
+                            if config.train.beta > 0:
+                                with torch.no_grad():
+                                    _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer_ref, pipeline, sample, j, config, rank)
+                        # grpo logic
+                        advantages = torch.clamp(
+                            sample["advantages"][:, j],
+                            -config.train.adv_clip_max,
+                            config.train.adv_clip_max,
+                        )
+                        ratio = torch.exp(log_prob - sample["log_probs"][:, j])
+                        print("ratio", ratio)
+                        unclipped_loss = -advantages * ratio
+                        clipped_loss = -advantages * torch.clamp(
+                            ratio,
+                            1.0 - config.train.clip_range,
+                            1.0 + config.train.clip_range,
+                        )
+                        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+                        policy_loss = policy_loss / gradient_accumulation_steps
                         if config.train.beta > 0:
-                            with torch.no_grad():
-                                _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer_ref, pipeline, sample, j, config, rank)
-                    # grpo logic
-                    advantages = torch.clamp(
-                        sample["advantages"][:, j],
-                        -config.train.adv_clip_max,
-                        config.train.adv_clip_max,
-                    )
-                    ratio = torch.exp(log_prob - sample["log_probs"][:, j])
-                    print("ratio", ratio)
-                    unclipped_loss = -advantages * ratio
-                    clipped_loss = -advantages * torch.clamp(
-                        ratio,
-                        1.0 - config.train.clip_range,
-                        1.0 + config.train.clip_range,
-                    )
-                    policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                    policy_loss = policy_loss / gradient_accumulation_steps
-                    if config.train.beta > 0:
-                        kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2), keepdim=True) / (2 * std_dev_t ** 2)
-                        kl_loss = torch.mean(kl_loss)
-                        kl_loss = kl_loss / gradient_accumulation_steps
-                        loss = policy_loss + config.train.beta * kl_loss
-                    else:
-                        loss = policy_loss
+                            kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2), keepdim=True) / (2 * std_dev_t ** 2)
+                            kl_loss = torch.mean(kl_loss)
+                            kl_loss = kl_loss / gradient_accumulation_steps
+                            loss = policy_loss + config.train.beta * kl_loss
+                        else:
+                            loss = policy_loss
 
-                    info["approx_kl"].append(
-                        0.5
-                        * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
-                    )
-                    info["clipfrac"].append(
-                        torch.mean(
-                            (
-                                torch.abs(ratio - 1.0) > config.train.clip_range
-                            ).float()
+                        info["approx_kl"].append(
+                            0.5
+                            * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
                         )
-                    )
-                    info["clipfrac_gt_one"].append(
-                        torch.mean(
-                            (
-                                ratio - 1.0 > config.train.clip_range
-                            ).float()
+                        info["clipfrac"].append(
+                            torch.mean(
+                                (
+                                    torch.abs(ratio - 1.0) > config.train.clip_range
+                                ).float()
+                            )
                         )
-                    )
-                    info["clipfrac_lt_one"].append(
-                        torch.mean(
-                            (
-                                1.0 - ratio > config.train.clip_range
-                            ).float()
+                        info["clipfrac_gt_one"].append(
+                            torch.mean(
+                                (
+                                    ratio - 1.0 > config.train.clip_range
+                                ).float()
+                            )
                         )
-                    )
-                    info["policy_loss"].append(policy_loss)
-                    if config.train.beta > 0:
-                        info["kl_loss"].append(kl_loss)
+                        info["clipfrac_lt_one"].append(
+                            torch.mean(
+                                (
+                                    1.0 - ratio > config.train.clip_range
+                                ).float()
+                            )
+                        )
+                        info["policy_loss"].append(policy_loss)
+                        if config.train.beta > 0:
+                            info["kl_loss"].append(kl_loss)
 
-                    info["loss"].append(loss)
+                        info["loss"].append(loss)
 
-                    # backward pass
-                    loss.backward()
+                        # backward pass (inside no_sync context)
+                        loss.backward()
+
+                    # Optimizer step (outside no_sync context so gradients are synced)
                     if should_sync:
                         # Clip gradients
                         torch.nn.utils.clip_grad_norm_(transformer.parameters(), config.train.max_grad_norm)

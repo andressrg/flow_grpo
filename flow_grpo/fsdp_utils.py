@@ -4,7 +4,12 @@ import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, MixedPrecision, CPUOffload
+from torch.distributed.fsdp import (
+    ShardingStrategy,
+    BackwardPrefetch,
+    MixedPrecision,
+    CPUOffload,
+)
 from torch.distributed.fsdp.api import StateDictType, FullStateDictConfig
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -19,7 +24,7 @@ class FSDPConfig:
     def __init__(
         self,
         sharding_strategy="FULL_SHARD",
-        backward_prefetch="BACKWARD_PRE", 
+        backward_prefetch="BACKWARD_PRE",
         cpu_offload=False,
         num_replicate=1,
         num_shard=8,
@@ -36,19 +41,20 @@ class FSDPConfig:
         self.use_activation_checkpointing = use_activation_checkpointing
         self.use_device_mesh = use_device_mesh
 
+
 def fsdp_wrapper(model, fsdp_config, get_transformer_layer_cls, ignored_modules=None):
     if ignored_modules is None:
         ignored_modules = []
-    
+
     # Setup device mesh for hybrid sharding if needed
     device_mesh = None
-    if fsdp_config.sharding_strategy == 'HYBRID_SHARD' and fsdp_config.use_device_mesh:
+    if fsdp_config.sharding_strategy == "HYBRID_SHARD" and fsdp_config.use_device_mesh:
         device_mesh = init_device_mesh(
-            "cuda", 
+            "cuda",
             mesh_shape=(fsdp_config.num_replicate, fsdp_config.num_shard),
-            mesh_dim_names=("replicate", "shard")
+            mesh_dim_names=("replicate", "shard"),
         )
-    
+
     # Create FSDP model
     fsdp_model = FSDP(
         model,
@@ -69,28 +75,29 @@ def fsdp_wrapper(model, fsdp_config, get_transformer_layer_cls, ignored_modules=
         device_mesh=device_mesh,
         use_orig_params=True,
     )
-    
+
     # Apply activation checkpointing if enabled
     if fsdp_config.use_activation_checkpointing:
+
         def grad_checkpoint_check_fn(module):
             """Check function to determine which modules to checkpoint"""
             return isinstance(module, tuple(get_transformer_layer_cls()))
-        
+
         apply_activation_checkpointing(
-            fsdp_model, 
+            fsdp_model,
             checkpoint_wrapper_fn=functools.partial(
                 checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT
-            ), 
-            check_fn=grad_checkpoint_check_fn
+            ),
+            check_fn=grad_checkpoint_check_fn,
         )
-    
+
     return fsdp_model
 
-    
+
 def save_fsdp_checkpoint(save_dir, model, global_step, rank):
     save_path = os.path.join(save_dir, f"checkpoint-{global_step}")
     os.makedirs(save_path, exist_ok=True)
-    
+
     # Save full state dict (rank 0 only)
     with FSDP.state_dict_type(
         model,
@@ -102,8 +109,9 @@ def save_fsdp_checkpoint(save_dir, model, global_step, rank):
             save_file(state_dict, os.path.join(save_path, "model.safetensors"))
             print(f"Model saved as safetensors: {save_path}/model.safetensors")
         del state_dict
-    
+
     dist.barrier()
+
 
 class OptimizerOffloadHook:
     def __init__(self):
@@ -111,25 +119,30 @@ class OptimizerOffloadHook:
 
     def pre_step_hook(self, optimizer, args, kwargs):
         for group in optimizer.param_groups:
-            for param in group['params']:
+            for param in group["params"]:
                 if param in optimizer.state and param in self.cpu_states:
                     state = optimizer.state[param]
                     for state_key, cpu_tensor in self.cpu_states[param].items():
-                        state[state_key] = cpu_tensor.to(param.device, non_blocking=True)
+                        state[state_key] = cpu_tensor.to(
+                            param.device, non_blocking=True
+                        )
                     del self.cpu_states[param]
 
     def post_step_hook(self, optimizer, args, kwargs):
         for group in optimizer.param_groups:
-            for param in group['params']:
+            for param in group["params"]:
                 if param in optimizer.state:
                     state = optimizer.state[param]
                     if state:
                         self.cpu_states[param] = {}
                         for state_key, state_tensor in state.items():
                             if isinstance(state_tensor, torch.Tensor):
-                                self.cpu_states[param][state_key] = state_tensor.to('cpu', non_blocking=True)
+                                self.cpu_states[param][state_key] = state_tensor.to(
+                                    "cpu", non_blocking=True
+                                )
                                 state[state_key] = torch.empty(0, device=param.device)
-                                
+
+
 def register_optimizer_offload_hooks(optimizer):
     hook = OptimizerOffloadHook()
 
@@ -138,21 +151,46 @@ def register_optimizer_offload_hooks(optimizer):
 
     return [pre_handle, post_handle], hook
 
+
+def init_distributed_1():
+    """Initialize distributed training"""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+    else:
+        print("Not using distributed mode")
+        return False, 0, 1, 0
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://")
+
+    # Setup device
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+
+    return True, rank, world_size, local_rank
+
+
 def init_distributed():
     """Initialize distributed training"""
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ['RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ['LOCAL_RANK'])
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
     else:
-        print('Not using distributed mode')
+        print("Not using distributed mode")
         return False, 0, 1, 0
-        
+
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://')
-    
+    import datetime
+
+    dist.init_process_group(
+        backend="nccl", init_method="env://", timeout=datetime.timedelta(seconds=1800)
+    )
+
     # Setup device
-    device = torch.device(f'cuda:{local_rank}')
+    device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
-    
+
     return True, rank, world_size, local_rank

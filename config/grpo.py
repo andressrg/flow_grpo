@@ -815,8 +815,8 @@ def counting_qwenimage_edit():
     config.eval_freq = 30
     config.save_dir = 'logs/pickscore/qwenimage_edit'
     config.reward_fn = {
-        "image_similarity": 0.2,
-        "geneval": 0.8,
+        "image_similarity": 1.0,  # Using only local reward for now
+        # "geneval": 0.8,  # Commented out - requires reward server at port 18086
     }
     config.per_prompt_stat_tracking = True
     return config
@@ -857,8 +857,8 @@ def counting_qwenimage_edit_fast():
     config.eval_freq = 30
     config.save_dir = 'logs/pickscore/qwenimage_edit'
     config.reward_fn = {
-        "image_similarity": 0.2,
-        "geneval": 0.8,
+        "image_similarity": 1.0,  # Using only local reward for now
+        # "geneval": 0.8,  # Commented out - requires reward server at port 18086
     }
     config.per_prompt_stat_tracking = True
     return config
@@ -875,11 +875,11 @@ def counting_qwenimage_edit_8gpu():
     config.sample.guidance_scale = 4
 
     config.resolution = 512
-    config.sample.train_batch_size = 4
+    config.sample.train_batch_size = 2  # Reduced from 4 to 2 for DDP memory (VAE encoding needs 2.26GB with bs=4, only ~5GB free)
     config.sample.num_image_per_prompt = 16
     config.sample.num_batches_per_epoch = int(32/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
-    config.sample.test_batch_size = 4 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
+    config.sample.test_batch_size = 2 # Reduced from 4 to 2 to match train_batch_size (eval runs on rank 0 only, same memory constraints)
 
     config.train.batch_size = config.sample.train_batch_size
     config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch//2
@@ -899,8 +899,8 @@ def counting_qwenimage_edit_8gpu():
     config.eval_freq = 30
     config.save_dir = 'logs/pickscore/qwenimage_edit'
     config.reward_fn = {
-        "image_similarity": 0.2,
-        "geneval": 0.8,
+        "image_similarity": 1.0,  # Using only local reward for now
+        # "geneval": 0.8,  # Commented out - requires reward server at port 18086
     }
     config.per_prompt_stat_tracking = True
     return config
