@@ -444,14 +444,14 @@ def main(_):
 
     # Setup FSDP configuration
     fsdp_config = FSDPConfig(
-        sharding_strategy="FULL_SHARD",
+        sharding_strategy="NO_SHARD",  # Changed from FULL_SHARD - keeps full model on each GPU like DDP
         backward_prefetch="BACKWARD_PRE",
         cpu_offload=False,  # Set to True if memory is limited
         num_replicate=1,
         num_shard=world_size,
         mixed_precision_dtype=inference_dtype,
         use_activation_checkpointing=config.activation_checkpointing,
-        use_device_mesh=False, 
+        use_device_mesh=False,
     )
     # Wrap language model with FSDP
     transformer.cpu().to(dtype=torch.float32)
